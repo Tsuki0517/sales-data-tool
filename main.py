@@ -1,7 +1,8 @@
 import os
-# 禁用streamlit版本与包元数据读取，彻底解决No package metadata报错
 os.environ["STREAMLIT_DISABLE_VERSION_CHECK"] = "1"
 os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+os.environ["STREAMLIT_SERVER_METRICS_ENABLED"] = "false"
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -49,25 +50,38 @@ def clean_raw_df(raw_df):
         df["订单部门"] = "未填写订单部门"
     return df
 
-# 文件拖拽上传入口
 def upload_file_area():
-    st.subheader("📁 上传出货表格（直接拖拽 / 点击选择 xls / xlsx 文件）")
-    uploaded_file = st.file_uploader("将Excel文件拖入下方框内", type=["xls", "xlsx"])
-    if uploaded_file is not None:
-        file_name = uploaded_file.name
-        st.success(f"✅ 已成功载入文件：{file_name}")
-        file_stream = BytesIO(uploaded_file.read())
-        if file_name.endswith(".xls"):
-            raw_data = pd.read_excel(file_stream, engine="xlrd")
+    st.subheader("📁 上传出货表格（支持多文件同时上传）")
+    uploaded_files = st.file_uploader("将Excel文件拖入下方框内（可多选）", type=["xls", "xlsx"], accept_multiple_files=True)
+    
+    if uploaded_files is not None and len(uploaded_files) > 0:
+        dfs = []
+        file_names = []
+        has_missing_dept = False
+        
+        for uploaded_file in uploaded_files:
+            file_name = uploaded_file.name
+            file_names.append(file_name)
+            st.success(f"✅ 已成功载入文件：{file_name}")
+            file_stream = BytesIO(uploaded_file.read())
+            if file_name.endswith(".xls"):
+                raw_data = pd.read_excel(file_stream, engine="xlrd")
+            else:
+                raw_data = pd.read_excel(file_stream, engine="openpyxl")
+            if "订单部门" not in raw_data.columns:
+                has_missing_dept = True
+            dfs.append(raw_data)
+        
+        if dfs:
+            combined_df = pd.concat(dfs, ignore_index=True)
+            clean_df = clean_raw_df(combined_df)
+            if has_missing_dept:
+                st.warning("⚠️ 部分文件无【订单部门】列，对应数据将归类为「未填写订单部门」")
+            return clean_df, ", ".join(file_names)
         else:
-            raw_data = pd.read_excel(file_stream, engine="openpyxl")
-        clean_df = clean_raw_df(raw_data)
-        # 提示订单部门列状态
-        if "订单部门" not in raw_data.columns:
-            st.warning("⚠️ 原表格无【订单部门】列，所有数据将归类为「未填写订单部门」")
-        return clean_df, file_name
+            return None, None
     else:
-        st.info("请上传出货明细Excel文件后继续操作")
+        st.info("请上传出货明细Excel文件后继续操作（支持多选）")
         return None, None
 
 # 汇总全部商品清单
@@ -78,30 +92,49 @@ def get_product_list(df):
     product_df["完整型号"] = product_df["商品名称"] + " | " + product_df["商品规格"]
     return product_df
 
-# 生成周期维度数据（按月/周聚合+环比+同比）
 def get_period_agg_data(item_df, period_type="month"):
     if period_type == "month":
-        # 按月聚合
         agg_df = item_df.groupby("年+月")["出货数量"].sum().reset_index()
         agg_df["年月"] = agg_df["年+月"].astype(str)
         agg_df.rename(columns={"出货数量": "本期销量"}, inplace=True)
-        # 月环比（上1行）
+        
         agg_df["上期销量"] = agg_df["本期销量"].shift(1)
         agg_df["月环比"] = agg_df["本期销量"].pct_change(1).apply(format_pct)
-        # 同比：同月份上一年（shift 12行）
-        agg_df["去年同期销量"] = agg_df["本期销量"].shift(12)
-        agg_df["同比"] = agg_df["本期销量"].pct_change(12).apply(format_pct)
+        
+        agg_df["年份"] = agg_df["年月"].str[:4].astype(int)
+        agg_df["月份"] = agg_df["年月"].str[-2:].astype(int)
+        
+        year_month_map = agg_df.set_index(["年份", "月份"])["本期销量"].to_dict()
+        
+        agg_df["去年同期销量"] = agg_df.apply(lambda row: year_month_map.get((row["年份"] - 1, row["月份"]), None), axis=1)
+        
+        def calc_yoy(row):
+            if row["去年同期销量"] is None or row["去年同期销量"] == 0:
+                return "无"
+            return format_pct((row["本期销量"] - row["去年同期销量"]) / row["去年同期销量"])
+        
+        agg_df["同比"] = agg_df.apply(calc_yoy, axis=1)
         x_col = "年月"
     else:
-        # 按周聚合
         agg_df = item_df.groupby("年+周")["出货数量"].sum().reset_index()
         agg_df["年周"] = agg_df["年+周"].astype(str)
         agg_df.rename(columns={"出货数量": "本期销量"}, inplace=True)
-        # 周环比（上1周）
         agg_df["上周销量"] = agg_df["本期销量"].shift(1)
         agg_df["周环比"] = agg_df["本期销量"].pct_change(1).apply(format_pct)
-        # 周无标准同比，仅保留环比
-        agg_df["同比"] = "无"
+        
+        agg_df["年份"] = agg_df["年周"].str[:4].astype(int)
+        agg_df["周数"] = agg_df["年周"].str[-2:].astype(int)
+        
+        year_week_map = agg_df.set_index(["年份", "周数"])["本期销量"].to_dict()
+        
+        agg_df["去年同期销量"] = agg_df.apply(lambda row: year_week_map.get((row["年份"] - 1, row["周数"]), None), axis=1)
+        
+        def calc_yoy(row):
+            if row["去年同期销量"] is None or row["去年同期销量"] == 0:
+                return "无"
+            return format_pct((row["本期销量"] - row["去年同期销量"]) / row["去年同期销量"])
+        
+        agg_df["同比"] = agg_df.apply(calc_yoy, axis=1)
         x_col = "年周"
     return agg_df, x_col
 
@@ -233,6 +266,9 @@ if __name__ == "__main__":
         st.stop()
 
     st.info(f"📅 当前：{res['index']['统计维度']} | 筛选范围：{res['index']['筛选范围']}")
+    available_years = sorted(df_data["年份"].unique())
+    if len(available_years) < 2:
+        st.warning(f"⚠️ 当前数据仅包含 {available_years} 年份，同比数据无法计算。请上传包含至少两年数据的文件以查看同比分析。")
     st.divider()
 
     # 顶部指标卡片
